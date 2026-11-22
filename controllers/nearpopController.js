@@ -7,9 +7,7 @@ exports.setDatabase = (connection) => {
 const query = (sql, params) => {
   return new Promise((resolve, reject) => {
     db.query(sql, params || [], (error, results) => {
-      if (error) {
-        return reject(error);
-      }
+      if (error) return reject(error);
       resolve(results);
     });
   });
@@ -33,7 +31,6 @@ const isValidCoordinates = (latitude, longitude) => {
 // --------------------------------------------------
 // CREATE POP
 // POST /api/pops
-// Creates POP + chat room + creator membership
 // --------------------------------------------------
 
 exports.createPop = async (req, res) => {
@@ -107,12 +104,9 @@ exports.createPop = async (req, res) => {
     }
 
     if (!db) {
-      throw new Error(
-        "Database has not been initialized. Call setDatabase(db) first.",
-      );
+      throw new Error("Database has not been initialized.");
     }
 
-    // Supports mysql.createPool() and mysql.createConnection().
     if (typeof db.getConnection === "function") {
       connection = await new Promise((resolve, reject) => {
         db.getConnection((error, conn) => {
@@ -135,7 +129,6 @@ exports.createPop = async (req, res) => {
 
     transactionStarted = true;
 
-    // 1. Create POP.
     const popResult = await runQuery(
       `INSERT INTO pops
        (
@@ -166,7 +159,6 @@ exports.createPop = async (req, res) => {
 
     const popId = popResult.insertId;
 
-    // 2. Create one chat room for this POP.
     const roomResult = await runQuery(
       `INSERT INTO chat_rooms (pop_id, created_at)
        VALUES (?, NOW())`,
@@ -175,7 +167,6 @@ exports.createPop = async (req, res) => {
 
     const chatId = roomResult.insertId;
 
-    // 3. Add POP creator as the first chat member.
     await runQuery(
       `INSERT INTO chat_members (chat_id, user_id, joined_at)
        VALUES (?, ?, NOW())`,
@@ -231,7 +222,8 @@ exports.createPop = async (req, res) => {
 // --------------------------------------------------
 // GET NEARBY POPS
 // GET /api/pops/nearby
-// radius = 5, 10, 20, 50, 100, 500 or all
+// radius = auto, 5, 10, 20, 50, 100, 500 or all
+// AUTO: Expands until at least 10 POPs are found.
 // --------------------------------------------------
 
 exports.getNearbyPops = async (req, res) => {
@@ -248,16 +240,14 @@ exports.getNearbyPops = async (req, res) => {
     const latitude = Number(req.query.latitude);
     const longitude = Number(req.query.longitude);
 
-    const radiusInput = String(req.query.radius || "5").toLowerCase();
-    const showAll = radiusInput === "all";
-    const radius = showAll ? null : Number(radiusInput);
+    const radiusInput = String(req.query.radius || "auto").toLowerCase();
 
-    console.log(
-      "Fetching nearby POPs for user_id:",
-      userId,
-      "with radius:",
-      radiusInput,
-    );
+    const isAuto = radiusInput === "auto";
+    const showAll = radiusInput === "all";
+
+    const requestedRadius = isAuto || showAll ? null : Number(radiusInput);
+
+    const allowedRadii = [5, 10, 20, 50, 100, 500];
 
     if (!isValidCoordinates(latitude, longitude)) {
       return res.status(400).json({
@@ -266,12 +256,14 @@ exports.getNearbyPops = async (req, res) => {
       });
     }
 
-    if (!showAll && (!Number.isFinite(radius) || radius <= 0)) {
+    if (!isAuto && !showAll && !allowedRadii.includes(requestedRadius)) {
       return res.status(400).json({
         success: false,
         message: "Invalid search radius.",
       });
     }
+
+    console.log("Fetching POPs:", userId, "Mode:", radiusInput);
 
     const distanceSql = `
       (
@@ -290,6 +282,74 @@ exports.getNearbyPops = async (req, res) => {
         )
       )
     `;
+
+    // ---------------------------------------------
+    // AUTOMATIC RADIUS SELECTION
+    // ---------------------------------------------
+
+    let selectedRadius = requestedRadius;
+    let availableCount = 0;
+
+    if (isAuto) {
+      const searchRadii = [5, 10, 20, 50, 100, 500];
+
+      selectedRadius = 500;
+
+      for (const radius of searchRadii) {
+        const countResult = await query(
+          `SELECT COUNT(*) AS total
+           FROM pops p
+           INNER JOIN nearpop_users u
+             ON u.id = p.user_id
+           WHERE p.status = 'ACTIVE'
+             AND p.expires_at > NOW()
+             AND p.user_id != ?
+             AND ${distanceSql} <= ?`,
+          [userId, latitude, longitude, latitude, radius],
+        );
+
+        const total = Number(countResult[0].total || 0);
+
+        console.log("Radius:", radius, "KM | POPs:", total);
+
+        if (total >= 10) {
+          selectedRadius = radius;
+          availableCount = total;
+          break;
+        }
+
+        if (radius === 500) {
+          selectedRadius = 500;
+          availableCount = total;
+        }
+      }
+    }
+
+    // ---------------------------------------------
+    // DISPLAY LIMIT
+    // ---------------------------------------------
+
+    let popLimit = 3;
+
+    if (showAll) {
+      popLimit = 3;
+    } else if (
+      selectedRadius === 5 ||
+      selectedRadius === 10 ||
+      selectedRadius === 20
+    ) {
+      popLimit = 20;
+    } else if (selectedRadius === 50) {
+      popLimit = 15;
+    } else if (selectedRadius === 100) {
+      popLimit = 8;
+    } else if (selectedRadius === 500) {
+      popLimit = 3;
+    }
+
+    // ---------------------------------------------
+    // FETCH POPS
+    // ---------------------------------------------
 
     let sql = `
       SELECT
@@ -339,12 +399,18 @@ exports.getNearbyPops = async (req, res) => {
     if (!showAll) {
       sql += ` AND ${distanceSql} <= ?`;
 
-      params.push(latitude, longitude, latitude, radius);
+      params.push(latitude, longitude, latitude, selectedRadius);
     }
 
-    sql += ` ORDER BY distance ASC, p.created_at DESC`;
+    sql += ` ORDER BY distance ASC, p.created_at DESC LIMIT ?`;
+
+    params.push(popLimit);
 
     const pops = await query(sql, params);
+
+    // ---------------------------------------------
+    // FORMAT RESPONSE
+    // ---------------------------------------------
 
     const formattedPops = pops.map((pop) => ({
       id: pop.id,
@@ -368,10 +434,14 @@ exports.getNearbyPops = async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Nearby users' POPs loaded successfully.",
+      message: "Nearby POPs loaded successfully.",
       data: {
-        radius: showAll ? "all" : radius,
+        mode: isAuto ? "auto" : showAll ? "all" : "manual",
+        radius: showAll ? "all" : selectedRadius,
         count: formattedPops.length,
+        available_count: isAuto ? availableCount : formattedPops.length,
+        target_count: 10,
+        limit: popLimit,
         pops: formattedPops,
       },
     });
@@ -387,7 +457,6 @@ exports.getNearbyPops = async (req, res) => {
 
 // --------------------------------------------------
 // GET MY POPS
-// GET /api/pops/my
 // --------------------------------------------------
 
 exports.getMyPops = async (req, res) => {
@@ -431,15 +500,9 @@ exports.getMyPops = async (req, res) => {
          ) AS user_joined
 
        FROM pops p
-
-       INNER JOIN nearpop_users u
-         ON u.id = p.user_id
-
-       LEFT JOIN chat_rooms cr
-         ON cr.pop_id = p.id
-
+       INNER JOIN nearpop_users u ON u.id = p.user_id
+       LEFT JOIN chat_rooms cr ON cr.pop_id = p.id
        WHERE p.user_id = ?
-
        ORDER BY p.created_at DESC`,
       [userId, userId],
     );
@@ -484,7 +547,6 @@ exports.getMyPops = async (req, res) => {
 
 // --------------------------------------------------
 // GET POP DETAILS
-// GET /api/pops/:id
 // --------------------------------------------------
 
 exports.getPopDetails = async (req, res) => {
@@ -544,7 +606,6 @@ exports.getPopDetails = async (req, res) => {
 
 // --------------------------------------------------
 // CLOSE POP
-// POST /api/pops/:id/close
 // --------------------------------------------------
 
 exports.closePop = async (req, res) => {
@@ -598,7 +659,6 @@ exports.closePop = async (req, res) => {
 
 // --------------------------------------------------
 // GET MY PROFILE
-// GET /api/users/profile
 // --------------------------------------------------
 
 exports.getProfile = async (req, res) => {
@@ -650,7 +710,6 @@ exports.getProfile = async (req, res) => {
 
 // --------------------------------------------------
 // GET MY CHATS
-// GET /api/chats
 // --------------------------------------------------
 
 exports.getMyChats = async (req, res) => {
@@ -683,15 +742,9 @@ exports.getMyChats = async (req, res) => {
          ) AS member_count
 
        FROM chat_members cm
-
-       INNER JOIN chat_rooms cr
-         ON cr.id = cm.chat_id
-
-       INNER JOIN pops p
-         ON p.id = cr.pop_id
-
+       INNER JOIN chat_rooms cr ON cr.id = cm.chat_id
+       INNER JOIN pops p ON p.id = cr.pop_id
        WHERE cm.user_id = ?
-
        ORDER BY cr.created_at DESC`,
       [userId],
     );
