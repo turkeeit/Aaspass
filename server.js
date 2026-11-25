@@ -1,9 +1,33 @@
-require("dotenv").config();
+const path = require("path");
+const dotenv = require("dotenv");
+
+// --------------------------------------------------
+// LOAD ENVIRONMENT VARIABLES
+// --------------------------------------------------
+
+const envPath = path.join(__dirname, ".env");
+
+const envResult = dotenv.config({
+  path: envPath,
+  override: true,
+});
+
+console.log("ENV file:", envPath);
+
+if (envResult.error) {
+  console.error("ENV loading error:", envResult.error.message);
+} else {
+  console.log("ENV file loaded successfully.");
+}
+
+console.log(
+  "Firebase credentials ENV:",
+  process.env.GOOGLE_APPLICATION_CREDENTIALS || "NOT CONFIGURED",
+);
 
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
-const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const multer = require("multer");
@@ -11,14 +35,64 @@ const { Server } = require("socket.io");
 
 const db = require("./config/dbconfig");
 
+// Controllers
 const authController = require("./controllers/authController");
 const nearpopController = require("./controllers/nearpopController");
 const chatController = require("./controllers/chatController");
+const notificationController = require("./controllers/notificationController");
 
+// Middleware
 const verifyToken = require("./middleware/authMiddleware");
+
+// Notification service
+const notificationService = require("./notificationService");
+
+// --------------------------------------------------
+// APP INITIALIZATION
+// --------------------------------------------------
 
 const app = express();
 const server = http.createServer(app);
+
+// --------------------------------------------------
+// DATABASE INITIALIZATION
+// --------------------------------------------------
+
+authController.setDatabase(db);
+nearpopController.setDatabase(db);
+chatController.setDatabase(db);
+
+notificationController.setDatabase(db);
+notificationService.setDatabase(db);
+
+// --------------------------------------------------
+// AUTOMATIC POP EXPIRY JOB
+// --------------------------------------------------
+
+const POP_EXPIRY_INTERVAL = 30 * 1000;
+
+function expireOldPops() {
+  const sql = `
+    UPDATE pops
+    SET status = 'EXPIRED'
+    WHERE status = 'ACTIVE'
+      AND expires_at <= NOW()
+  `;
+
+  db.query(sql, [], (error, result) => {
+    if (error) {
+      console.error("POP expiry job error:", error);
+      return;
+    }
+
+    if (result.affectedRows > 0) {
+      console.log(
+        "[" + new Date().toISOString() + "] Expired POPs:",
+        result.affectedRows,
+      );
+    }
+  });
+}
 
 // --------------------------------------------------
 // IMAGE UPLOAD CONFIGURATION
@@ -56,7 +130,6 @@ const storage = multer.diskStorage({
   filename: (req, file, callback) => {
     let extension = path.extname(file.originalname).toLowerCase();
 
-    // Use MIME type if the original filename has no extension.
     if (!extension) {
       const mimeExtensions = {
         "image/jpeg": ".jpg",
@@ -90,7 +163,6 @@ const fileFilter = (req, file, callback) => {
   const validMimeType = allowedMimeTypes.includes(mimeType);
   const validExtension = allowedExtensions.includes(extension);
 
-  // Accept if either MIME type or extension identifies a supported image.
   if (validMimeType || validExtension) {
     return callback(null, true);
   }
@@ -108,7 +180,6 @@ const fileFilter = (req, file, callback) => {
 const upload = multer({
   storage: storage,
   fileFilter: fileFilter,
-
   limits: {
     fileSize: 10 * 1024 * 1024,
   },
@@ -124,6 +195,8 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
 });
+
+chatController.setSocketServer(io);
 
 // --------------------------------------------------
 // MIDDLEWARE
@@ -141,18 +214,6 @@ app.use(
 
 // Serve uploaded images.
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-// --------------------------------------------------
-// DATABASE CONNECTION
-// --------------------------------------------------
-
-authController.setDatabase(db);
-
-nearpopController.setDatabase(db);
-
-chatController.setDatabase(db);
-
-chatController.setSocketServer(io);
 
 // --------------------------------------------------
 // AUTH ROUTES
@@ -201,6 +262,22 @@ app.post(
 );
 
 // --------------------------------------------------
+// NOTIFICATION ROUTES
+// --------------------------------------------------
+
+app.post(
+  "/api/notifications/register-token",
+  verifyToken,
+  notificationController.registerToken,
+);
+
+app.post(
+  "/api/notifications/remove-token",
+  verifyToken,
+  notificationController.removeToken,
+);
+
+// --------------------------------------------------
 // PROFILE ROUTE
 // --------------------------------------------------
 
@@ -213,9 +290,12 @@ app.get("/api/users/profile", verifyToken, nearpopController.getProfile);
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "NearPop API is running.",
+    message: "POPCHAAT API is running.",
     socket: "enabled",
     image_upload: "enabled",
+    notifications: "enabled",
+    pop_expiry: "enabled",
+    pop_expiry_interval: "30 seconds",
     supported_image_formats: [
       "JPG",
       "JPEG",
@@ -247,7 +327,6 @@ app.use((req, res) => {
 app.use((error, req, res, next) => {
   console.error("Server error:", error);
 
-  // Remove uploaded file if a later middleware/controller fails.
   if (req.file && req.file.path && fs.existsSync(req.file.path)) {
     fs.unlink(req.file.path, (unlinkError) => {
       if (unlinkError) {
@@ -286,7 +365,17 @@ app.use((error, req, res, next) => {
 const PORT = process.env.PORT || 6000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("NearPop API running on port " + PORT);
+  console.log("POPCHAAT API running on port " + PORT);
   console.log("Socket.IO server running.");
   console.log("Chat image uploads enabled.");
+  console.log("Notification routes enabled.");
+
+  // Expire existing POPs immediately.
+  expireOldPops();
+
+  // Check for expired POPs every 30 seconds.
+  setInterval(expireOldPops, POP_EXPIRY_INTERVAL);
+
+  console.log("Automatic POP expiry job enabled.");
+  console.log("POP expiry check interval: 30 seconds.");
 });

@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const notificationService = require("../notificationService");
 
 let db;
 let io = null;
@@ -36,6 +37,69 @@ const sendAck = (callback, data) => {
     callback(data);
   }
 };
+
+// --------------------------------------------------
+// POP EXPIRATION
+// --------------------------------------------------
+
+async function expirePops() {
+  await query(
+    `UPDATE pops
+     SET status = 'EXPIRED'
+     WHERE status = 'ACTIVE'
+       AND expires_at <= NOW()`,
+    [],
+  );
+}
+
+// Get the POP connected to a chat.
+// Also handles expiry immediately using MySQL server time.
+
+async function getChatPopState(chatId) {
+  const rows = await query(
+    `SELECT
+       p.id AS pop_id,
+       p.status,
+       p.expires_at,
+       CASE
+         WHEN p.expires_at <= NOW() THEN 1
+         ELSE 0
+       END AS is_expired
+     FROM chat_rooms cr
+     INNER JOIN pops p ON p.id = cr.pop_id
+     WHERE cr.id = ?
+     LIMIT 1`,
+    [chatId],
+  );
+
+  if (!rows.length) {
+    const error = new Error("Chat or associated POP not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const pop = rows[0];
+
+  if (pop.status === "ACTIVE" && Number(pop.is_expired) === 1) {
+    await query(
+      `UPDATE pops
+       SET status = 'EXPIRED'
+       WHERE id = ?
+         AND status = 'ACTIVE'
+         AND expires_at <= NOW()`,
+      [pop.pop_id],
+    );
+
+    pop.status = "EXPIRED";
+  }
+
+  return {
+    pop_id: pop.pop_id,
+    status: pop.status,
+    expires_at: pop.expires_at,
+    read_only: pop.status !== "ACTIVE",
+  };
+}
 
 // --------------------------------------------------
 // MESSAGE RECEIPTS
@@ -180,18 +244,61 @@ async function isChatMember(chatId, userId) {
 }
 
 // --------------------------------------------------
+// PUSH NOTIFICATIONS
+// --------------------------------------------------
+
+async function notifySavedChatMessage(savedMessage) {
+  if (!savedMessage) return;
+
+  try {
+    const rooms = await query(
+      `SELECT pop_id
+       FROM chat_rooms
+       WHERE id = ?
+       LIMIT 1`,
+      [savedMessage.chat_id],
+    );
+
+    const popId = rooms.length ? rooms[0].pop_id : "";
+
+    const isImage = savedMessage.message_type === "image";
+
+    const messageText =
+      isImage && (!savedMessage.message || savedMessage.message === "Image")
+        ? ""
+        : savedMessage.message;
+
+    await notificationService.notifyChatMembers({
+      chatId: savedMessage.chat_id,
+      senderId: savedMessage.user_id,
+      senderName: savedMessage.sender_name,
+      messageType: savedMessage.message_type,
+      messageText,
+      popId,
+    });
+  } catch (error) {
+    console.error("Chat notification error:", error);
+  }
+}
+
+// --------------------------------------------------
 // SAVE TEXT MESSAGE
+// Used by both REST API and Socket.IO.
 // --------------------------------------------------
 
 async function saveChatMessage(chatId, userId, message) {
   const cleanMessage = String(message || "").trim();
 
   if (!cleanMessage) {
-    throw new Error("Message cannot be empty.");
+    const error = new Error("Message cannot be empty.");
+    error.statusCode = 400;
+    throw error;
   }
 
   if (cleanMessage.length > 2000) {
-    throw new Error("Message is too long.");
+    const error = new Error("Message is too long.");
+    error.statusCode = 400;
+    throw error;
   }
 
   const member = await isChatMember(chatId, userId);
@@ -199,6 +306,22 @@ async function saveChatMessage(chatId, userId, message) {
   if (!member) {
     const error = new Error("You are not a member of this chat.");
     error.statusCode = 403;
+    throw error;
+  }
+
+  // Block sending messages after POP expiry or closure.
+  const pop = await getChatPopState(chatId);
+
+  if (pop.read_only) {
+    const error = new Error(
+      pop.status === "EXPIRED"
+        ? "This POP has expired. You can only read previous messages."
+        : "This POP is closed. You can only read previous messages.",
+    );
+
+    error.statusCode = 403;
+    error.readOnly = true;
+
     throw error;
   }
 
@@ -230,7 +353,11 @@ async function saveChatMessage(chatId, userId, message) {
     [messageId],
   );
 
-  return rows[0];
+  const savedMessage = rows[0];
+
+  await notifySavedChatMessage(savedMessage);
+
+  return savedMessage;
 }
 
 // --------------------------------------------------
@@ -268,7 +395,11 @@ exports.setSocketServer = (socketServer) => {
 
     socket.join(userRoom(userId));
 
+    // ----------------------------------------------
     // JOIN CHAT
+    // Members can join even after POP expiry.
+    // ----------------------------------------------
+
     socket.on("join_chat", async (payload, callback) => {
       try {
         const chatId = Number(payload?.chat_id);
@@ -289,6 +420,8 @@ exports.setSocketServer = (socketServer) => {
           });
         }
 
+        const pop = await getChatPopState(chatId);
+
         socket.join(chatRoom(chatId));
 
         await markMessagesDelivered(chatId, userId);
@@ -297,18 +430,23 @@ exports.setSocketServer = (socketServer) => {
           success: true,
           message: "Joined chat room.",
           chat_id: chatId,
+          pop_status: pop.status,
+          read_only: pop.read_only,
         });
       } catch (error) {
         console.error("join_chat socket error:", error);
 
         sendAck(callback, {
           success: false,
-          message: "Unable to join chat.",
+          message: error.message || "Unable to join chat.",
         });
       }
     });
 
+    // ----------------------------------------------
     // SEND TEXT MESSAGE
+    // ----------------------------------------------
+
     socket.on("send_message", async (payload, callback) => {
       try {
         const chatId = Number(payload?.chat_id);
@@ -347,11 +485,16 @@ exports.setSocketServer = (socketServer) => {
         sendAck(callback, {
           success: false,
           message: error.message || "Unable to send message.",
+          read_only: Boolean(error.readOnly),
         });
       }
     });
 
+    // ----------------------------------------------
     // MARK CHAT AS READ
+    // Still allowed after expiry.
+    // ----------------------------------------------
+
     socket.on("mark_read", async (payload, callback) => {
       try {
         const chatId = Number(payload?.chat_id);
@@ -388,7 +531,11 @@ exports.setSocketServer = (socketServer) => {
       }
     });
 
+    // ----------------------------------------------
     // TYPING INDICATOR
+    // Disabled for expired/closed POPs.
+    // ----------------------------------------------
+
     socket.on("typing", async (payload) => {
       try {
         const chatId = Number(payload?.chat_id);
@@ -398,6 +545,10 @@ exports.setSocketServer = (socketServer) => {
         const member = await isChatMember(chatId, userId);
 
         if (!member) return;
+
+        const pop = await getChatPopState(chatId);
+
+        if (pop.read_only) return;
 
         socket.to(chatRoom(chatId)).emit("user_typing", {
           chat_id: chatId,
@@ -419,6 +570,7 @@ exports.setSocketServer = (socketServer) => {
 
 // --------------------------------------------------
 // GET ALL CHATS
+// Only actual chat members can see their chats.
 // --------------------------------------------------
 
 exports.getMyChats = async (req, res) => {
@@ -431,6 +583,8 @@ exports.getMyChats = async (req, res) => {
         message: "Unauthorized",
       });
     }
+
+    await expirePops();
 
     const chats = await query(
       `SELECT
@@ -449,19 +603,19 @@ exports.getMyChats = async (req, res) => {
             ELSE 'REPLIED_POP'
           END AS chat_type,
 
+          CASE
+            WHEN p.status = 'ACTIVE' AND p.expires_at > NOW()
+            THEN 0
+            ELSE 1
+          END AS read_only,
+
           (
             SELECT COUNT(*)
             FROM chat_members cm2
             WHERE cm2.chat_id = cr.id
           ) AS member_count,
 
-          (
-            SELECT cm3.joined_at
-            FROM chat_members cm3
-            WHERE cm3.chat_id = cr.id
-              AND cm3.user_id = ?
-            LIMIT 1
-          ) AS joined_at,
+          cm.joined_at AS joined_at,
 
           (
             SELECT cm4.message
@@ -481,21 +635,9 @@ exports.getMyChats = async (req, res) => {
 
        FROM chat_rooms cr
        INNER JOIN pops p ON p.id = cr.pop_id
+       INNER JOIN chat_members cm ON cm.chat_id = cr.id
 
-       WHERE
-          p.user_id = ?
-          OR EXISTS (
-            SELECT 1
-            FROM chat_members cm
-            WHERE cm.chat_id = cr.id
-              AND cm.user_id = ?
-              AND EXISTS (
-                SELECT 1
-                FROM chat_messages reply
-                WHERE reply.chat_id = cr.id
-                  AND reply.user_id = ?
-              )
-          )
+       WHERE cm.user_id = ?
 
        ORDER BY
           COALESCE(
@@ -506,7 +648,7 @@ exports.getMyChats = async (req, res) => {
             ),
             cr.created_at
           ) DESC`,
-      [userId, userId, userId, userId, userId],
+      [userId, userId],
     );
 
     return res.json({
@@ -521,19 +663,20 @@ exports.getMyChats = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Unable to load your chats.",
+      message: "Unable to load chats.",
     });
   }
 };
 
 // --------------------------------------------------
 // JOIN POP CHAT
+// Only ACTIVE, unexpired POPs can be joined.
 // --------------------------------------------------
 
 exports.joinPopChat = async (req, res) => {
   try {
     const userId = getUserId(req);
-    const popId = req.params.id;
+    const popId = Number(req.params.id);
 
     if (!userId) {
       return res.status(401).json({
@@ -542,8 +685,23 @@ exports.joinPopChat = async (req, res) => {
       });
     }
 
+    if (!Number.isInteger(popId) || popId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid POP ID.",
+      });
+    }
+
     const pops = await query(
-      `SELECT id, user_id, status, expires_at
+      `SELECT
+         id,
+         user_id,
+         status,
+         expires_at,
+         CASE
+           WHEN expires_at <= NOW() THEN 1
+           ELSE 0
+         END AS is_expired
        FROM pops
        WHERE id = ?
        LIMIT 1`,
@@ -559,10 +717,24 @@ exports.joinPopChat = async (req, res) => {
 
     const pop = pops[0];
 
-    if (pop.status !== "ACTIVE" || new Date(pop.expires_at) <= new Date()) {
+    if (pop.status === "ACTIVE" && Number(pop.is_expired) === 1) {
+      await query(
+        `UPDATE pops
+         SET status = 'EXPIRED'
+         WHERE id = ?
+           AND status = 'ACTIVE'
+           AND expires_at <= NOW()`,
+        [popId],
+      );
+
+      pop.status = "EXPIRED";
+    }
+
+    if (pop.status !== "ACTIVE") {
       return res.status(400).json({
         success: false,
-        message: "This POP is no longer active",
+        message: "This POP is no longer active.",
+        status: pop.status,
       });
     }
 
@@ -625,23 +797,26 @@ exports.joinPopChat = async (req, res) => {
       message: "Joined POP chat successfully",
       data: {
         chat_id: chatId,
-        pop_id: Number(popId),
+        pop_id: popId,
         user_id: userId,
+        status: pop.status,
+        read_only: false,
       },
     });
   } catch (error) {
     console.error("joinPopChat error:", error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
-      message: "Unable to join POP chat",
-      error: error.message,
+      message: error.message || "Unable to join POP chat",
     });
   }
 };
 
 // --------------------------------------------------
 // GET CHAT MESSAGES
+// Members can read history even after expiry.
+// Non-members cannot access history.
 // --------------------------------------------------
 
 exports.getChatMessages = async (req, res) => {
@@ -668,9 +843,11 @@ exports.getChatMessages = async (req, res) => {
     if (!member) {
       return res.status(403).json({
         success: false,
-        message: "You are not a member of this chat",
+        message: "You are not a member of this chat.",
       });
     }
+
+    const pop = await getChatPopState(chatId);
 
     const messages = await query(
       `SELECT
@@ -725,21 +902,24 @@ exports.getChatMessages = async (req, res) => {
       [userId, userId, chatId],
     );
 
+    // Reading previous messages remains allowed after expiry.
     await markMessagesRead(chatId, userId);
 
     return res.status(200).json({
       success: true,
       data: {
+        pop_status: pop.status,
+        expires_at: pop.expires_at,
+        read_only: pop.read_only,
         messages,
       },
     });
   } catch (error) {
     console.error("getChatMessages error:", error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
-      message: "Unable to load messages",
-      error: error.message,
+      message: error.message || "Unable to load messages.",
     });
   }
 };
@@ -796,6 +976,7 @@ exports.sendChatMessage = async (req, res) => {
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message || "Unable to send message",
+      read_only: Boolean(error.readOnly),
     });
   }
 };
@@ -840,13 +1021,28 @@ exports.sendChatImage = async (req, res) => {
       });
     }
 
+    // Block image uploads after POP expiry or closure.
+    const pop = await getChatPopState(chatId);
+
+    if (pop.read_only) {
+      const error = new Error(
+        pop.status === "EXPIRED"
+          ? "This POP has expired. You can only read previous messages."
+          : "This POP is closed. You can only read previous messages.",
+      );
+
+      error.statusCode = 403;
+      error.readOnly = true;
+
+      throw error;
+    }
+
     const caption = String(req.body.caption || "").trim();
 
     if (caption.length > 2000) {
-      return res.status(400).json({
-        success: false,
-        message: "Caption is too long.",
-      });
+      const error = new Error("Caption is too long.");
+      error.statusCode = 400;
+      throw error;
     }
 
     const mediaUrl = `/uploads/chat-images/${req.file.filename}`;
@@ -882,6 +1078,8 @@ exports.sendChatImage = async (req, res) => {
 
     const savedMessage = rows[0];
 
+    await notifySavedChatMessage(savedMessage);
+
     const outgoing = {
       ...savedMessage,
       is_me: false,
@@ -907,6 +1105,7 @@ exports.sendChatImage = async (req, res) => {
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message || "Unable to send image.",
+      read_only: Boolean(error.readOnly),
     });
   }
 };

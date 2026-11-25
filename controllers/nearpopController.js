@@ -29,6 +29,20 @@ const isValidCoordinates = (latitude, longitude) => {
 };
 
 // --------------------------------------------------
+// EXPIRE POPS
+// --------------------------------------------------
+
+const expirePops = async () => {
+  return query(
+    `UPDATE pops
+     SET status = 'EXPIRED'
+     WHERE status = 'ACTIVE'
+       AND expires_at <= NOW()`,
+    [],
+  );
+};
+
+// --------------------------------------------------
 // CREATE POP
 // POST /api/pops
 // --------------------------------------------------
@@ -222,8 +236,6 @@ exports.createPop = async (req, res) => {
 // --------------------------------------------------
 // GET NEARBY POPS
 // GET /api/pops/nearby
-// radius = auto, 5, 10, 20, 50, 100, 500 or all
-// AUTO: Expands until at least 10 POPs are found.
 // --------------------------------------------------
 
 exports.getNearbyPops = async (req, res) => {
@@ -237,6 +249,8 @@ exports.getNearbyPops = async (req, res) => {
       });
     }
 
+    await expirePops();
+
     const latitude = Number(req.query.latitude);
     const longitude = Number(req.query.longitude);
 
@@ -248,6 +262,9 @@ exports.getNearbyPops = async (req, res) => {
     const requestedRadius = isAuto || showAll ? null : Number(radiusInput);
 
     const allowedRadii = [5, 10, 20, 50, 100, 500];
+
+    const POP_LIMIT = 20;
+    const AUTO_TARGET = 20;
 
     if (!isValidCoordinates(latitude, longitude)) {
       return res.status(400).json({
@@ -265,6 +282,7 @@ exports.getNearbyPops = async (req, res) => {
 
     console.log("Fetching POPs:", userId, "Mode:", radiusInput);
 
+    // Distance calculation in kilometers.
     const distanceSql = `
       (
         6371 * ACOS(
@@ -283,12 +301,31 @@ exports.getNearbyPops = async (req, res) => {
       )
     `;
 
-    // ---------------------------------------------
-    // AUTOMATIC RADIUS SELECTION
-    // ---------------------------------------------
+    // Count eligible POPs inside a radius.
+    const countWithinRadius = async (radius) => {
+      const countResult = await query(
+        `SELECT COUNT(*) AS total
+         FROM pops p
+         INNER JOIN nearpop_users u
+           ON u.id = p.user_id
+         WHERE p.status = 'ACTIVE'
+           AND p.expires_at > NOW()
+           AND p.user_id != ?
+           AND ${distanceSql} <= ?`,
+        [userId, latitude, longitude, latitude, radius],
+      );
+
+      return Number(countResult[0]?.total || 0);
+    };
 
     let selectedRadius = requestedRadius;
     let availableCount = 0;
+
+    // --------------------------------------------------
+    // AUTOMATIC SEARCH
+    // 5 -> 10 -> 20 -> 50 -> 100 -> 500 KM
+    // Stop when 20 eligible POPs are found.
+    // --------------------------------------------------
 
     if (isAuto) {
       const searchRadii = [5, 10, 20, 50, 100, 500];
@@ -296,28 +333,17 @@ exports.getNearbyPops = async (req, res) => {
       selectedRadius = 500;
 
       for (const radius of searchRadii) {
-        const countResult = await query(
-          `SELECT COUNT(*) AS total
-           FROM pops p
-           INNER JOIN nearpop_users u
-             ON u.id = p.user_id
-           WHERE p.status = 'ACTIVE'
-             AND p.expires_at > NOW()
-             AND p.user_id != ?
-             AND ${distanceSql} <= ?`,
-          [userId, latitude, longitude, latitude, radius],
-        );
+        const total = await countWithinRadius(radius);
 
-        const total = Number(countResult[0].total || 0);
+        console.log("Auto radius:", radius, "KM | eligible POPs:", total);
 
-        console.log("Radius:", radius, "KM | POPs:", total);
-
-        if (total >= 10) {
+        if (total >= AUTO_TARGET) {
           selectedRadius = radius;
           availableCount = total;
           break;
         }
 
+        // At 500 KM, use whatever is available.
         if (radius === 500) {
           selectedRadius = 500;
           availableCount = total;
@@ -325,31 +351,37 @@ exports.getNearbyPops = async (req, res) => {
       }
     }
 
-    // ---------------------------------------------
-    // DISPLAY LIMIT
-    // ---------------------------------------------
+    // --------------------------------------------------
+    // ALL POPS
+    // --------------------------------------------------
+    else if (showAll) {
+      const countResult = await query(
+        `SELECT COUNT(*) AS total
+         FROM pops p
+         INNER JOIN nearpop_users u
+           ON u.id = p.user_id
+         WHERE p.status = 'ACTIVE'
+           AND p.expires_at > NOW()
+           AND p.user_id != ?`,
+        [userId],
+      );
 
-    let popLimit = 3;
-
-    if (showAll) {
-      popLimit = 3;
-    } else if (
-      selectedRadius === 5 ||
-      selectedRadius === 10 ||
-      selectedRadius === 20
-    ) {
-      popLimit = 20;
-    } else if (selectedRadius === 50) {
-      popLimit = 15;
-    } else if (selectedRadius === 100) {
-      popLimit = 8;
-    } else if (selectedRadius === 500) {
-      popLimit = 3;
+      availableCount = Number(countResult[0]?.total || 0);
     }
 
-    // ---------------------------------------------
-    // FETCH POPS
-    // ---------------------------------------------
+    // --------------------------------------------------
+    // MANUAL RADIUS SEARCH
+    // --------------------------------------------------
+    else {
+      availableCount = await countWithinRadius(selectedRadius);
+    }
+
+    // All modes return a maximum of 20 POPs.
+    const popLimit = POP_LIMIT;
+
+    // --------------------------------------------------
+    // FETCH POP DETAILS
+    // --------------------------------------------------
 
     let sql = `
       SELECT
@@ -363,9 +395,12 @@ exports.getNearbyPops = async (req, res) => {
         p.expires_at,
         p.status,
         p.created_at,
+
         u.name AS user_name,
         u.profile_picture,
+
         ${distanceSql} AS distance,
+
         cr.id AS chat_id,
 
         (
@@ -396,21 +431,26 @@ exports.getNearbyPops = async (req, res) => {
 
     const params = [latitude, longitude, latitude, userId, userId];
 
+    // Apply distance filter except for All POPs.
     if (!showAll) {
       sql += ` AND ${distanceSql} <= ?`;
 
       params.push(latitude, longitude, latitude, selectedRadius);
     }
 
-    sql += ` ORDER BY distance ASC, p.created_at DESC LIMIT ?`;
+    // Nearest POPs first.
+    sql += `
+      ORDER BY distance ASC, p.created_at DESC
+      LIMIT ?
+    `;
 
     params.push(popLimit);
 
     const pops = await query(sql, params);
 
-    // ---------------------------------------------
+    // --------------------------------------------------
     // FORMAT RESPONSE
-    // ---------------------------------------------
+    // --------------------------------------------------
 
     const formattedPops = pops.map((pop) => ({
       id: pop.id,
@@ -418,30 +458,49 @@ exports.getNearbyPops = async (req, res) => {
       title: pop.title,
       description: pop.description,
       category: pop.category,
+
       latitude: pop.latitude,
       longitude: pop.longitude,
+
       expires_at: pop.expires_at,
       status: pop.status,
       created_at: pop.created_at,
+
       user_name: pop.user_name,
       profile_picture: pop.profile_picture,
+
       distance: Number(pop.distance || 0),
+
       chat_id: pop.chat_id,
+
       member_count: Number(pop.member_count || 0),
+
       user_joined: Boolean(pop.user_joined),
+
       is_mine: false,
     }));
 
     return res.json({
       success: true,
       message: "Nearby POPs loaded successfully.",
+
       data: {
         mode: isAuto ? "auto" : showAll ? "all" : "manual",
+
         radius: showAll ? "all" : selectedRadius,
+
+        // POPs actually returned.
         count: formattedPops.length,
-        available_count: isAuto ? availableCount : formattedPops.length,
-        target_count: 10,
-        limit: popLimit,
+
+        // Total eligible POPs in the search range.
+        available_count: availableCount,
+
+        // Auto-search target.
+        target_count: AUTO_TARGET,
+
+        // Maximum returned POPs.
+        limit: POP_LIMIT,
+
         pops: formattedPops,
       },
     });
@@ -469,6 +528,8 @@ exports.getMyPops = async (req, res) => {
         message: "Unauthorized",
       });
     }
+
+    await expirePops();
 
     const pops = await query(
       `SELECT
@@ -568,6 +629,8 @@ exports.getPopDetails = async (req, res) => {
       });
     }
 
+    await expirePops();
+
     const rows = await query(
       `SELECT
          p.*,
@@ -627,12 +690,15 @@ exports.closePop = async (req, res) => {
       });
     }
 
+    await expirePops();
+
     const result = await query(
       `UPDATE pops
        SET status = 'CLOSED'
        WHERE id = ?
          AND user_id = ?
-         AND status = 'ACTIVE'`,
+         AND status = 'ACTIVE'
+         AND expires_at > NOW()`,
       [popId, userId],
     );
 
@@ -710,6 +776,7 @@ exports.getProfile = async (req, res) => {
 
 // --------------------------------------------------
 // GET MY CHATS
+// Only chat members can see their chats.
 // --------------------------------------------------
 
 exports.getMyChats = async (req, res) => {
@@ -723,6 +790,8 @@ exports.getMyChats = async (req, res) => {
       });
     }
 
+    await expirePops();
+
     const chats = await query(
       `SELECT
          cr.id AS chat_id,
@@ -734,6 +803,13 @@ exports.getMyChats = async (req, res) => {
          p.status,
          p.expires_at,
          p.user_id AS pop_owner_id,
+
+         CASE
+           WHEN p.status = 'ACTIVE'
+             AND p.expires_at > NOW()
+           THEN 0
+           ELSE 1
+         END AS read_only,
 
          (
            SELECT COUNT(*)
@@ -767,7 +843,6 @@ exports.getMyChats = async (req, res) => {
 
 // --------------------------------------------------
 // EXPLICIT MODULE EXPORTS
-// Keep this at the very bottom.
 // --------------------------------------------------
 
 module.exports = {
