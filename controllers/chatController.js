@@ -39,6 +39,59 @@ const sendAck = (callback, data) => {
 };
 
 // --------------------------------------------------
+// POP ATTACHMENTS
+// --------------------------------------------------
+
+async function getPopAttachments(popIds) {
+  if (!Array.isArray(popIds) || popIds.length === 0) {
+    return {};
+  }
+
+  const validPopIds = [
+    ...new Set(
+      popIds.map(Number).filter((id) => Number.isInteger(id) && id > 0),
+    ),
+  ];
+
+  if (validPopIds.length === 0) {
+    return {};
+  }
+
+  const placeholders = validPopIds.map(() => "?").join(",");
+
+  const rows = await query(
+    `SELECT
+       id,
+       pop_id,
+       image_url,
+       created_at
+     FROM pop_attachments
+     WHERE pop_id IN (${placeholders})
+     ORDER BY id ASC`,
+    validPopIds,
+  );
+
+  const attachmentsMap = {};
+
+  for (const row of rows) {
+    const key = String(row.pop_id);
+
+    if (!attachmentsMap[key]) {
+      attachmentsMap[key] = [];
+    }
+
+    attachmentsMap[key].push({
+      id: row.id,
+      url: row.image_url,
+      image_url: row.image_url,
+      created_at: row.created_at,
+    });
+  }
+
+  return attachmentsMap;
+}
+
+// --------------------------------------------------
 // POP EXPIRATION
 // --------------------------------------------------
 
@@ -309,7 +362,6 @@ async function saveChatMessage(chatId, userId, message) {
     throw error;
   }
 
-  // Block sending messages after POP expiry or closure.
   const pop = await getChatPopState(chatId);
 
   if (pop.read_only) {
@@ -395,10 +447,7 @@ exports.setSocketServer = (socketServer) => {
 
     socket.join(userRoom(userId));
 
-    // ----------------------------------------------
     // JOIN CHAT
-    // Members can join even after POP expiry.
-    // ----------------------------------------------
 
     socket.on("join_chat", async (payload, callback) => {
       try {
@@ -443,9 +492,7 @@ exports.setSocketServer = (socketServer) => {
       }
     });
 
-    // ----------------------------------------------
     // SEND TEXT MESSAGE
-    // ----------------------------------------------
 
     socket.on("send_message", async (payload, callback) => {
       try {
@@ -490,10 +537,7 @@ exports.setSocketServer = (socketServer) => {
       }
     });
 
-    // ----------------------------------------------
     // MARK CHAT AS READ
-    // Still allowed after expiry.
-    // ----------------------------------------------
 
     socket.on("mark_read", async (payload, callback) => {
       try {
@@ -531,10 +575,7 @@ exports.setSocketServer = (socketServer) => {
       }
     });
 
-    // ----------------------------------------------
     // TYPING INDICATOR
-    // Disabled for expired/closed POPs.
-    // ----------------------------------------------
 
     socket.on("typing", async (payload) => {
       try {
@@ -570,7 +611,7 @@ exports.setSocketServer = (socketServer) => {
 
 // --------------------------------------------------
 // GET ALL CHATS
-// Only actual chat members can see their chats.
+// Includes POP attachments.
 // --------------------------------------------------
 
 exports.getMyChats = async (req, res) => {
@@ -651,11 +692,21 @@ exports.getMyChats = async (req, res) => {
       [userId, userId],
     );
 
+    // Fetch POP attachments for all chats.
+    const popIds = chats.map((chat) => chat.pop_id);
+
+    const attachmentsMap = await getPopAttachments(popIds);
+
+    const chatsWithAttachments = chats.map((chat) => ({
+      ...chat,
+      attachments: attachmentsMap[String(chat.pop_id)] || [],
+    }));
+
     return res.json({
       success: true,
       data: {
-        count: chats.length,
-        chats,
+        count: chatsWithAttachments.length,
+        chats: chatsWithAttachments,
       },
     });
   } catch (error) {
@@ -902,7 +953,6 @@ exports.getChatMessages = async (req, res) => {
       [userId, userId, chatId],
     );
 
-    // Reading previous messages remains allowed after expiry.
     await markMessagesRead(chatId, userId);
 
     return res.status(200).json({
@@ -1021,7 +1071,6 @@ exports.sendChatImage = async (req, res) => {
       });
     }
 
-    // Block image uploads after POP expiry or closure.
     const pop = await getChatPopState(chatId);
 
     if (pop.read_only) {

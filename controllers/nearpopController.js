@@ -1,12 +1,19 @@
+const fs = require("fs");
+const path = require("path");
+
 let db;
 
 exports.setDatabase = (connection) => {
   db = connection;
 };
 
-const query = (sql, params) => {
+// --------------------------------------------------
+// DATABASE QUERY
+// --------------------------------------------------
+
+const query = (sql, params = []) => {
   return new Promise((resolve, reject) => {
-    db.query(sql, params || [], (error, results) => {
+    db.query(sql, params, (error, results) => {
       if (error) return reject(error);
       resolve(results);
     });
@@ -29,6 +36,82 @@ const isValidCoordinates = (latitude, longitude) => {
 };
 
 // --------------------------------------------------
+// IMAGE HELPERS
+// --------------------------------------------------
+
+const MAX_POP_IMAGES = 3;
+
+const getUploadedFiles = (req) => {
+  return Array.isArray(req.files) ? req.files : [];
+};
+
+const cleanupUploadedFiles = async (files) => {
+  if (!files || !files.length) return;
+
+  await Promise.all(
+    files.map((file) => {
+      if (!file || !file.path) return Promise.resolve();
+
+      return fs.promises.unlink(file.path).catch((error) => {
+        if (error.code !== "ENOENT") {
+          console.error("Unable to delete uploaded image:", error);
+        }
+      });
+    }),
+  );
+};
+
+// Uses PUBLIC_BASE_URL when configured.
+// Otherwise uses the current request host.
+const getImageUrl = (req, filename) => {
+  const configuredBaseUrl = process.env.PUBLIC_BASE_URL;
+
+  const baseUrl = configuredBaseUrl
+    ? configuredBaseUrl.replace(/\/+$/, "")
+    : `${req.protocol}://${req.get("host")}`;
+
+  return `${baseUrl}/uploads/pop-images/${encodeURIComponent(filename)}`;
+};
+
+// Fetch images for multiple POPs in one query.
+const attachImagesToPops = async (pops) => {
+  if (!pops || !pops.length) return pops;
+
+  const popIds = pops.map((pop) => pop.id);
+  const placeholders = popIds.map(() => "?").join(",");
+
+  const images = await query(
+    `SELECT id, pop_id, image_url, created_at
+     FROM pop_attachments
+     WHERE pop_id IN (${placeholders})
+     ORDER BY id ASC`,
+    popIds,
+  );
+
+  const imageMap = {};
+
+  images.forEach((image) => {
+    const key = String(image.pop_id);
+
+    if (!imageMap[key]) {
+      imageMap[key] = [];
+    }
+
+    imageMap[key].push({
+      id: image.id,
+      url: image.image_url,
+      image_url: image.image_url,
+      created_at: image.created_at,
+    });
+  });
+
+  return pops.map((pop) => ({
+    ...pop,
+    attachments: imageMap[String(pop.id)] || [],
+  }));
+};
+
+// --------------------------------------------------
 // EXPIRE POPS
 // --------------------------------------------------
 
@@ -45,12 +128,16 @@ const expirePops = async () => {
 // --------------------------------------------------
 // CREATE POP
 // POST /api/pops
+// Supports up to 3 optional images.
 // --------------------------------------------------
 
 exports.createPop = async (req, res) => {
   let connection = null;
   let ownsConnection = false;
   let transactionStarted = false;
+  let creationSucceeded = false;
+
+  const uploadedFiles = getUploadedFiles(req);
 
   const runQuery = (sql, params = []) => {
     return new Promise((resolve, reject) => {
@@ -67,7 +154,14 @@ exports.createPop = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
+      });
+    }
+
+    if (uploadedFiles.length > MAX_POP_IMAGES) {
+      return res.status(400).json({
+        success: false,
+        message: "You can upload a maximum of 3 images per POP.",
       });
     }
 
@@ -121,6 +215,7 @@ exports.createPop = async (req, res) => {
       throw new Error("Database has not been initialized.");
     }
 
+    // Get a dedicated connection for the transaction.
     if (typeof db.getConnection === "function") {
       connection = await new Promise((resolve, reject) => {
         db.getConnection((error, conn) => {
@@ -142,6 +237,10 @@ exports.createPop = async (req, res) => {
     });
 
     transactionStarted = true;
+
+    // --------------------------------------------------
+    // INSERT POP
+    // --------------------------------------------------
 
     const popResult = await runQuery(
       `INSERT INTO pops
@@ -173,6 +272,10 @@ exports.createPop = async (req, res) => {
 
     const popId = popResult.insertId;
 
+    // --------------------------------------------------
+    // CREATE CHAT ROOM
+    // --------------------------------------------------
+
     const roomResult = await runQuery(
       `INSERT INTO chat_rooms (pop_id, created_at)
        VALUES (?, NOW())`,
@@ -181,11 +284,41 @@ exports.createPop = async (req, res) => {
 
     const chatId = roomResult.insertId;
 
+    // --------------------------------------------------
+    // ADD POP OWNER TO CHAT
+    // --------------------------------------------------
+
     await runQuery(
       `INSERT INTO chat_members (chat_id, user_id, joined_at)
        VALUES (?, ?, NOW())`,
       [chatId, userId],
     );
+
+    // --------------------------------------------------
+    // SAVE POP IMAGES
+    // --------------------------------------------------
+
+    const savedAttachments = [];
+
+    for (const file of uploadedFiles) {
+      const imageUrl = getImageUrl(req, file.filename);
+
+      await runQuery(
+        `INSERT INTO pop_attachments
+         (pop_id, image_url)
+         VALUES (?, ?)`,
+        [popId, imageUrl],
+      );
+
+      savedAttachments.push({
+        url: imageUrl,
+        image_url: imageUrl,
+      });
+    }
+
+    // --------------------------------------------------
+    // COMMIT TRANSACTION
+    // --------------------------------------------------
 
     await new Promise((resolve, reject) => {
       connection.commit((error) => {
@@ -195,6 +328,7 @@ exports.createPop = async (req, res) => {
     });
 
     transactionStarted = false;
+    creationSucceeded = true;
 
     return res.status(201).json({
       success: true,
@@ -210,6 +344,7 @@ exports.createPop = async (req, res) => {
         longitude,
         durationMinutes,
         status: "ACTIVE",
+        attachments: savedAttachments,
       },
     });
   } catch (error) {
@@ -217,6 +352,8 @@ exports.createPop = async (req, res) => {
       await new Promise((resolve) => {
         connection.rollback(() => resolve());
       });
+
+      transactionStarted = false;
     }
 
     console.error("createPop error:", error);
@@ -227,6 +364,11 @@ exports.createPop = async (req, res) => {
       error: error.message,
     });
   } finally {
+    // Remove uploaded images if the POP transaction failed.
+    if (!creationSucceeded) {
+      await cleanupUploadedFiles(uploadedFiles);
+    }
+
     if (ownsConnection && connection) {
       connection.release();
     }
@@ -245,7 +387,7 @@ exports.getNearbyPops = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -282,7 +424,6 @@ exports.getNearbyPops = async (req, res) => {
 
     console.log("Fetching POPs:", userId, "Mode:", radiusInput);
 
-    // Distance calculation in kilometers.
     const distanceSql = `
       (
         6371 * ACOS(
@@ -301,7 +442,6 @@ exports.getNearbyPops = async (req, res) => {
       )
     `;
 
-    // Count eligible POPs inside a radius.
     const countWithinRadius = async (radius) => {
       const countResult = await query(
         `SELECT COUNT(*) AS total
@@ -323,8 +463,6 @@ exports.getNearbyPops = async (req, res) => {
 
     // --------------------------------------------------
     // AUTOMATIC SEARCH
-    // 5 -> 10 -> 20 -> 50 -> 100 -> 500 KM
-    // Stop when 20 eligible POPs are found.
     // --------------------------------------------------
 
     if (isAuto) {
@@ -343,7 +481,6 @@ exports.getNearbyPops = async (req, res) => {
           break;
         }
 
-        // At 500 KM, use whatever is available.
         if (radius === 500) {
           selectedRadius = 500;
           availableCount = total;
@@ -376,11 +513,8 @@ exports.getNearbyPops = async (req, res) => {
       availableCount = await countWithinRadius(selectedRadius);
     }
 
-    // All modes return a maximum of 20 POPs.
-    const popLimit = POP_LIMIT;
-
     // --------------------------------------------------
-    // FETCH POP DETAILS
+    // FETCH POPS
     // --------------------------------------------------
 
     let sql = `
@@ -431,28 +565,29 @@ exports.getNearbyPops = async (req, res) => {
 
     const params = [latitude, longitude, latitude, userId, userId];
 
-    // Apply distance filter except for All POPs.
     if (!showAll) {
       sql += ` AND ${distanceSql} <= ?`;
 
       params.push(latitude, longitude, latitude, selectedRadius);
     }
 
-    // Nearest POPs first.
     sql += `
       ORDER BY distance ASC, p.created_at DESC
       LIMIT ?
     `;
 
-    params.push(popLimit);
+    params.push(POP_LIMIT);
 
     const pops = await query(sql, params);
+
+    // Fetch images for all returned POPs in one query.
+    const popsWithImages = await attachImagesToPops(pops);
 
     // --------------------------------------------------
     // FORMAT RESPONSE
     // --------------------------------------------------
 
-    const formattedPops = pops.map((pop) => ({
+    const formattedPops = popsWithImages.map((pop) => ({
       id: pop.id,
       user_id: pop.user_id,
       title: pop.title,
@@ -478,6 +613,8 @@ exports.getNearbyPops = async (req, res) => {
       user_joined: Boolean(pop.user_joined),
 
       is_mine: false,
+
+      attachments: pop.attachments,
     }));
 
     return res.json({
@@ -489,16 +626,12 @@ exports.getNearbyPops = async (req, res) => {
 
         radius: showAll ? "all" : selectedRadius,
 
-        // POPs actually returned.
         count: formattedPops.length,
 
-        // Total eligible POPs in the search range.
         available_count: availableCount,
 
-        // Auto-search target.
         target_count: AUTO_TARGET,
 
-        // Maximum returned POPs.
         limit: POP_LIMIT,
 
         pops: formattedPops,
@@ -525,7 +658,7 @@ exports.getMyPops = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -568,7 +701,9 @@ exports.getMyPops = async (req, res) => {
       [userId, userId],
     );
 
-    const formattedPops = pops.map((pop) => ({
+    const popsWithImages = await attachImagesToPops(pops);
+
+    const formattedPops = popsWithImages.map((pop) => ({
       id: pop.id,
       user_id: pop.user_id,
       title: pop.title,
@@ -586,6 +721,7 @@ exports.getMyPops = async (req, res) => {
       member_count: Number(pop.member_count || 0),
       user_joined: Boolean(pop.user_joined),
       is_mine: true,
+      attachments: pop.attachments,
     }));
 
     return res.json({
@@ -618,7 +754,7 @@ exports.getPopDetails = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -651,10 +787,28 @@ exports.getPopDetails = async (req, res) => {
       });
     }
 
+    const attachmentRows = await query(
+      `SELECT id, pop_id, image_url, created_at
+       FROM pop_attachments
+       WHERE pop_id = ?
+       ORDER BY id ASC`,
+      [popId],
+    );
+
+    const attachments = attachmentRows.map((image) => ({
+      id: image.id,
+      url: image.image_url,
+      image_url: image.image_url,
+      created_at: image.created_at,
+    }));
+
     return res.json({
       success: true,
       data: {
-        pop: rows[0],
+        pop: {
+          ...rows[0],
+          attachments,
+        },
       },
     });
   } catch (error) {
@@ -679,7 +833,7 @@ exports.closePop = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -734,7 +888,7 @@ exports.getProfile = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -776,7 +930,6 @@ exports.getProfile = async (req, res) => {
 
 // --------------------------------------------------
 // GET MY CHATS
-// Only chat members can see their chats.
 // --------------------------------------------------
 
 exports.getMyChats = async (req, res) => {
@@ -786,7 +939,7 @@ exports.getMyChats = async (req, res) => {
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized",
+        message: "Unauthorized.",
       });
     }
 
@@ -825,10 +978,23 @@ exports.getMyChats = async (req, res) => {
       [userId],
     );
 
+    const chatsWithImages = await attachImagesToPops(
+      chats.map((chat) => ({
+        ...chat,
+        id: chat.pop_id,
+      })),
+    );
+
+    const formattedChats = chatsWithImages.map((chat) => {
+      const { id, ...chatData } = chat;
+
+      return chatData;
+    });
+
     return res.json({
       success: true,
       data: {
-        chats: chats,
+        chats: formattedChats,
       },
     });
   } catch (error) {
